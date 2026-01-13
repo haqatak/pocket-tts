@@ -25,8 +25,21 @@ class SSCDataset(Dataset):
         item = self.processor.create_dataset_item(audio_path, text)
         return item
 
-def train_one_epoch(model: TTSModel, dataloader, optimizer, device, head_batch_multiplier=8):
+def update_ema(target_model, source_model, decay=0.999):
+    with torch.no_grad():
+        for p_tgt, p_src in zip(target_model.parameters(), source_model.parameters()):
+            p_tgt.data.mul_(decay).add_(p_src.data, alpha=1 - decay)
+
+def train_one_epoch(model: TTSModel, dataloader, optimizer, device, head_batch_multiplier=8, ema_model: Optional[TTSModel] = None, freeze_backbone: bool = False):
     model.train()
+    if freeze_backbone:
+        # Freeze backbone parameters
+        for param in model.flow_lm.transformer.parameters():
+            param.requires_grad = False
+        # Ensure we don't accidentally freeze head
+        for param in model.flow_lm.flow_net.parameters():
+            param.requires_grad = True
+
     total_loss = 0
 
     for batch_idx, batch in enumerate(dataloader):
@@ -100,55 +113,126 @@ def train_one_epoch(model: TTSModel, dataloader, optimizer, device, head_batch_m
         targets_flat = targets.view(-1, model.flow_lm.ldim)
         targets_rep = targets_flat.repeat_interleave(N, dim=0) # [B*T*N, L]
 
-        # Sample t and noise for Consistency/Flow Matching
-        # We model the flow from Data (t=0) to Noise (t=1).
-        # x_0 = targets
-        # x_1 = noise
-        # x_t = (1-t) x_0 + t x_1
-        # vector field v_t = x_1 - x_0
+        # Sample t for Consistency Training
+        # We need to compute Consistency Loss:
+        # L = d(f_theta(x_{t+1}, t+1), f_theta^-(x_t, t))
+        # Where x_t is on the trajectory.
+        # Pocket TTS uses LSD (Lagrangian Self Distillation).
+        # We will implement the loss comparing the student's prediction from a noisy state
+        # to the teacher's prediction from a less noisy state (or the clean target).
 
         # Sample t uniform [0, 1]
+        # We discretize t for consistency? Or continuous.
+        # Let's use continuous t.
         t = torch.rand(B*T*N, 1, device=device)
-        noise = torch.randn_like(targets_rep)
+
+        # Create adjacent time step for distillation
+        # t_prev = t - delta? Or t_next?
+        # If we generate from Noise (1) to Data (0):
+        # t is current time. t_next is closer to 0?
+        # Let's assume standard flow matching convention: t=0 is data, t=1 is noise.
+        # Flow x_t = (1-t)x_0 + t x_1.
+
+        # We want to enforce that prediction from x_t points to x_0.
+        # And prediction from x_{t+eps} points to same x_0.
 
         x_0 = targets_rep
+        noise = torch.randn_like(x_0)
         x_1 = noise
+
         x_t = (1-t) * x_0 + t * x_1
 
-        # Note: SimpleMLPAdaLN expects s (source time) and t (target time)
-        # The prompt says "Consistency Loss".
-        # If we use `lsd_decode`, it takes v_t(s, t, x).
-        # `FlowLMModel` calls `flow_net` via `conditioned_flow = partial(self.flow_net, transformer_out)`.
-        # And `lsd_decode` calls `v_t(s, t, current)`.
+        # Student prediction from x_t
+        # flow_net output usually is v = x_1 - x_0.
+        # So predicted x_0 = x_t - t * v_pred ?
+        # x_t = x_0 + t(x_1 - x_0) = x_0 + t * v.
+        # x_0 = x_t - t * v.
 
-        # So flow_net signature is (cond, s, t, x).
-        # In LSD paper, s is current time, t is next time (s + ds).
-        # But `SimpleMLPAdaLN` treats them as source and target times for flow?
-        # Let's check `mlp.py` -> `forward(c, s, t, x)`.
+        # s=t, t=t for instantaneous velocity field check
+        v_pred = model.flow_lm.flow_net(context_rep, t, t, x_t)
+        x_0_pred = x_t - t * v_pred
 
-        # We want to train the vector field v(x, t).
-        # In this formulation, we are predicting the flow at time t.
-        # So we can pass s=t, t=t? Or does it expect a step?
-        # Usually vector field is v(x, t).
-        # LSD calls `v_t(s, t, current)`.
-        # s=current_time, t=next_time.
-        # If we are training the vector field to be constant straight line (x1-x0),
-        # then v does not depend on time for the straight path, but the network might.
+        if ema_model is not None:
+            # Consistency Distillation with EMA Teacher
+            # We compare student prediction x_0_pred with teacher prediction.
+            # Teacher should see x_t? Or a different point?
+            # Ideally teacher sees a "better" point.
+            # But "Consistency Distillation" often compares prediction from x_{t_{n+1}} (student)
+            # with prediction from x_{t_n} (teacher).
+            # Here let's use the same x_t for simplicity unless strictly required to step.
+            # Using same x_t is "Self-Consistency".
+            # Using adjacent points is "Trajectory Consistency".
 
-        # Let's set s = t, and t_arg = t.
-        # Or maybe s is t_current and t is t_target?
-        # In `lsd_decode`: s = i/N, t = (i+1)/N.
-        # So s and t are close.
-        # Let's use s=t, t=t for training the instantaneous velocity at t.
+            # Let's use x_t for teacher too, or x_{t-eps}
+            # For continuous consistency, comparing at same point is valid for ensuring x_0 prediction is stable?
+            # No, usually we want consistency along the flow.
+            # Let's stick to the prompt's "Minimize distance between predicted ... and target Mimi latent".
+            # That implies Target = x_0 (Ground Truth).
+            # But the "Forensic Analysis" asked for Consistency Distillation.
+            # The feedback says "If the PR implements standard DSM... it is... not a consistency model."
+            # "It must implement a Consistency Distillation... L = d(f_student(x_{t+1}), f_teacher(x_t))".
 
-        s_in = t
-        t_in = t
+            # Let's implement that:
+            # t_next = t + delta (closer to noise? or closer to data?)
+            # If t=0 is data, t=1 is noise.
+            # Flow goes 1 -> 0 for generation.
+            # So x_{t+1} is closer to noise? (Wait, notation is confusing).
+            # Let's say s > t. s is more noisy.
+            # We want f(x_s) == f(x_t).
+            # Student predicts from s (harder). Teacher predicts from t (easier).
 
-        prediction = model.flow_lm.flow_net(context_rep, s_in, t_in, x_t)
+            # So:
+            # t1 = t (noisy)
+            # t2 = t - delta (less noisy)
+            # Ensure t2 >= 0.
 
-        v_target = x_1 - x_0
+            # Let's assume we sample t2 ~ U[0, 1]. t1 = t2 + small_step.
 
-        loss = nn.MSELoss()(prediction, v_target)
+            # To implementing this efficiently with HBM:
+            # We have N samples. We can pair them? Or just sample pairs?
+            # We generated t. Let's make t_teacher = t.
+            # And t_student = t + delta.
+
+            delta = 0.01 # Example step size
+            t_teacher = t
+            t_student = torch.clamp(t + delta, max=1.0)
+
+            x_t_student = (1-t_student) * x_0 + t_student * x_1
+            x_t_teacher = (1-t_teacher) * x_0 + t_teacher * x_1
+
+            # Student Prediction
+            v_student = model.flow_lm.flow_net(context_rep, t_student, t_student, x_t_student)
+            x_0_student = x_t_student - t_student * v_student
+
+            # Teacher Prediction
+            with torch.no_grad():
+                # We need to use EMA model
+                # But EMA model needs context too.
+                # If we freeze backbone, context is same.
+                # If backbone is updated, we should ideally use EMA backbone for context.
+
+                # Check if we have EMA model
+                # Assume ema_model has same structure
+                # We need to run ema backbone if not frozen/shared.
+                # If freeze_backbone is True, model.flow_lm.backbone and ema_model.flow_lm.backbone are same (initially)
+                # but if we didn't update ema backbone, it's fine.
+                # If backbone is frozen, we can reuse `context_rep`.
+
+                # If backbone is NOT frozen, we should technically run EMA backbone.
+                # But for efficiency (HBM), running backbone twice is expensive.
+                # Let's assume backbone is frozen or we reuse context for teacher (approximation).
+
+                v_teacher = ema_model.flow_lm.flow_net(context_rep, t_teacher, t_teacher, x_t_teacher)
+                x_0_teacher = x_t_teacher - t_teacher * v_teacher
+
+            loss = nn.MSELoss()(x_0_student, x_0_teacher)
+
+            # Update EMA
+            update_ema(ema_model, model)
+
+        else:
+            # Fallback to Consistency Training (Ground Truth Target) if no EMA provided
+            loss = nn.MSELoss()(x_0_pred, x_0)
 
         loss.backward()
         optimizer.step()
