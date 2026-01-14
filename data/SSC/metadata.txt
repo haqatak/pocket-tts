@@ -1,0 +1,5 @@
+test_001.wav|Hei, jeg heter Ola og kommer fra Oslo.
+test_002.wav|Det er fint vær i dag.
+test_003.wav|Jeg liker å lese norske bøker.
+test_004.wav|Takk for maten, det var veldig godt.
+test_005.wav|Kan du hjelpe meg med dette?
