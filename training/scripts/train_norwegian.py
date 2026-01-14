@@ -20,10 +20,12 @@ import logging
 import torch
 import copy
 from pathlib import Path
+from torch import nn
 
 from pocket_tts.models.tts_model import TTSModel
 from training.data_prep import SSCProcessor, download_ssc
 from training.train import SSCDataset, train_one_epoch, update_ema
+from pocket_tts.modules.mlp import SimpleMLPAdaLN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +62,36 @@ def load_dataset_from_metadata(metadata_path: Path) -> list[tuple[str, str]]:
 
     logger.info(f"Loaded {len(data_list)} samples from {metadata_path}")
     return data_list
+
+
+def resize_flow_lm(flow_lm, config, new_ldim=512):
+    """
+    Re-initialize FlowLM head and input projection for continuous latents (dim=512)
+    instead of quantized codes (dim=32).
+    """
+    device = flow_lm.device
+    dtype = flow_lm.dtype
+
+    logger.info(f"Resizing FlowLM: ldim {flow_lm.ldim} -> {new_ldim}")
+    flow_lm.ldim = new_ldim
+
+    # Re-init buffers with new shape
+    flow_lm.register_buffer("emb_std", torch.ones(new_ldim, dtype=dtype, device=device))
+    flow_lm.register_buffer("emb_mean", torch.zeros(new_ldim, dtype=dtype, device=device))
+    flow_lm.bos_emb = torch.nn.Parameter(torch.randn(new_ldim, dtype=dtype, device=device))
+
+    # Re-init input projection
+    # input_linear: ldim -> dim
+    flow_lm.input_linear = nn.Linear(new_ldim, flow_lm.dim, bias=False, dtype=dtype).to(device)
+
+    # Re-init Flow Matching Head (MLP)
+    # The head predicts vector field of shape (ldim)
+    # Config needs to be passed to reconstruct it with same depth/width
+    flow_lm.flow_net = SimpleMLPAdaLN.from_pydantic_config(
+        config.flow_lm,
+        latent_dim=new_ldim,
+        cond_dim=flow_lm.dim
+    ).to(device).to(dtype)
 
 
 def main():
@@ -155,6 +187,11 @@ def main():
     logger.info("Loading pretrained pocket-tts model...")
     model = TTSModel.load_model()  # Uses default variant and parameters
     device = torch.device(args.device)
+
+    # Resize FlowLM for continuous latents (512 dim)
+    if model.flow_lm.ldim != 512:
+        resize_flow_lm(model.flow_lm, model.config, new_ldim=512)
+
     model.flow_lm.to(device)
     model.mimi.to(device)
 
@@ -163,6 +200,11 @@ def main():
     if args.use_ema:
         logger.info("Creating EMA model for consistency distillation...")
         ema_model = TTSModel.load_model()
+
+        # Resize EMA model too
+        if ema_model.flow_lm.ldim != 512:
+            resize_flow_lm(ema_model.flow_lm, ema_model.config, new_ldim=512)
+
         ema_model.flow_lm.to(device)
         ema_model.mimi.to(device)
         # Copy weights
