@@ -1,9 +1,60 @@
 import torch
 import torch.nn as nn
+from einops import rearrange
 from torch.nn import functional as F
+from typing import NamedTuple
 
 from pocket_tts.modules.rope import RotaryEmbedding
 from pocket_tts.modules.stateful_module import StatefulModule
+
+
+class KVCacheResult(NamedTuple):
+    keys: torch.Tensor
+    values: torch.Tensor
+    positions: torch.Tensor
+
+    @staticmethod
+    def from_kv(keys: torch.Tensor, values: torch.Tensor) -> "KVCacheResult":
+        B, H, T, D = keys.shape
+        assert tuple(values.shape[:-1]) == (B, H, T)
+        positions = torch.arange(T, device=keys.device, dtype=torch.long)
+        return KVCacheResult(keys, values, positions.expand(B, -1))
+
+
+def complete(
+    cache: torch.Tensor, end_offset: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> KVCacheResult:
+    capacity = cache.shape[3]
+    assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
+    B, H, T, D = k.shape
+    assert T > 0
+    indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+    indexes = indexes + end_offset.view(-1, 1)
+    indexes = indexes % capacity
+    # indexes is [B, T]
+    # k is [B, H, T, D]
+    # cache is [B, H, T', D]
+    this_indexes = indexes.view(B, 1, T, 1)
+    this_indexes = this_indexes.expand(-1, H, T, D)
+    cache[0].scatter_(2, this_indexes, k)
+    cache[1].scatter_(2, this_indexes, v)
+
+    keys = cache[0]
+    values = cache[1]
+
+    indexes = torch.arange(capacity, device=end_offset.device, dtype=torch.long)
+
+    # end_index correspond to the actual index where the last value was written.
+    last_offset = end_offset.view(-1, 1) + T - 1
+    end_index = last_offset % capacity
+    delta = indexes - end_index
+
+    positions = torch.where(delta <= 0, last_offset + delta, last_offset + delta - capacity)
+    end_offset[:] = end_offset + T
+    invalid = indexes >= end_offset.view(-1, 1)
+    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
+    return KVCacheResult(keys, values, positions)
 
 
 def complete_kv(
@@ -44,81 +95,78 @@ class StreamingMultiheadAttention(StatefulModule):
         dtype (torch.dtype, optional): dtype to use.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, rope: RotaryEmbedding):
+    def __init__(
+        self, embed_dim: int, num_heads: int, rope: RotaryEmbedding, context: int | None = None
+    ):
         super().__init__()
 
         self.embed_dim = embed_dim
         self.rope = rope
         self.num_heads = num_heads
+        self.context = context
 
-        out_dim = embed_dim
-        num_kv = num_heads
-        kv_dim = (embed_dim // num_heads) * num_kv
-        out_dim += 2 * kv_dim
-        mult = 1
-        self.in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, mult * embed_dim, bias=False)
-
-    def _get_mask(self, shape: tuple[int, int], shift: int, device: torch.device) -> torch.Tensor:
-        return _materialize_causal_mask(shape, shift=shift, device=device)
+        out_dim = 3 * embed_dim
+        self.in_proj = nn.Linear(embed_dim, out_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
     def init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
         dim_per_head = self.embed_dim // self.num_heads
-        initial_current_end = torch.zeros((0,)).to(self.in_proj.weight.device)
-        return dict(
-            current_end=initial_current_end,
-            cache=torch.full(
-                (2, batch_size, sequence_length, self.num_heads, dim_per_head),
-                float("NaN"),
-                device=self.in_proj.weight.device,
-                dtype=self.in_proj.weight.dtype,
-            ),
+        state = {}
+        state["offset"] = torch.zeros(batch_size, dtype=torch.long)
+        state["cache"] = torch.zeros(
+            (2, batch_size, self.num_heads, sequence_length, dim_per_head)
         )
+        state["end_offset"] = torch.zeros(batch_size, dtype=torch.long)
+        return state
 
-    def increment_step(self, state: dict, increment: int = 1):
-        new_size = state["current_end"].shape[0] + increment
-        state["current_end"] = torch.zeros((new_size,)).to(state["current_end"].device)
+    def increment_step(self, state, increment: int = 1):
+        state["offset"] += increment
 
-    def _complete_kv(self, k, v, state: dict | None):
-        k, v = complete_kv(state["cache"], state["current_end"], k, v)
-        return k, v
-
-    def _apply_rope(self, query: torch.Tensor, key: torch.Tensor, state: dict | None):
-        # Apply rope embeddings to query and key tensors.
-        streaming_offset = self._streaming_offset(state)
-        return self.rope(query, key, offset=streaming_offset)
-
-    def _streaming_offset(self, state: dict | None) -> torch.Tensor | int:
-        return state["current_end"].shape[0]
-
-    def check_model_state(self, model_state: dict):
+    def _complete_kv(self, k, v, model_state: dict | None):
         if model_state is None:
-            raise ValueError("model_state must be provided")
-        return self.get_state(model_state)
+            # Not streaming
+            return KVCacheResult.from_kv(k, v)
+        else:
+            # Streaming
+            layer_state = self.get_state(model_state)
+            return complete(layer_state["cache"], layer_state["end_offset"], k, v)
 
-    def forward(self, query: torch.Tensor, model_state: dict | None):
-        state = self.check_model_state(model_state)
+    def _streaming_offset(self, model_state: dict | None, query: torch.Tensor) -> torch.Tensor:
+        if model_state is None:
+            return torch.zeros(query.shape[0], device=query.device, dtype=torch.long)
+        else:
+            return self.get_state(model_state)["offset"]
 
+    def forward(self, query: torch.Tensor, model_state: dict | None) -> torch.Tensor:
+        B, T = query.shape[:2]
+        offset = self._streaming_offset(model_state, query)
         projected = self.in_proj(query)
-        # Reshape from (b, t, p*h*d) to (b, t, p, h, d) where p=3, h=num_heads
-        b, t, _ = projected.shape
+
+        # Reshape from (b, t, p*h*d) to (p, b, h, t, d)
         d = self.embed_dim // self.num_heads
-        packed = projected.view(b, t, 3, self.num_heads, d)
-        q, k, v = torch.unbind(packed, dim=2)
-        q, k = self._apply_rope(q, k, state)
-        k, v = self._complete_kv(k, v, state)
+        q, k, v = rearrange(projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads, d=d)
 
-        mask_shape = (query.shape[1], query.shape[1] + state["current_end"].shape[0])
-        shift = state["current_end"].shape[0]
+        # Permute from (b, h, t, d) to (b, t, h, d) for rope
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        q, k = self.rope(q, k, offset)
+        # Permute back from (b, t, h, d) to (b, h, t, d)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
 
-        attn_mask = self._get_mask(mask_shape, shift=shift, device=q.device)
+        k, v, pos_k = self._complete_kv(k, v, model_state)
+        pos_k = pos_k[:, None]
+        pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(
+            -1, 1
+        )
+        delta = pos_q - pos_k
+        attn_bias = (pos_k >= 0) & (delta >= 0)
+        if self.context is not None:
+            attn_bias = attn_bias & (delta < self.context)
+        attn_bias = attn_bias[:, None]
 
-        q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask)
-        x = x.transpose(1, 2)
-        # Reshape from (b, t, h, d) to (b, t, h*d)
-        b, t, h, d = x.shape
-        x = x.reshape(b, t, h * d)
+        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+
+        x = rearrange(x, "b h t d -> b t (h d)")
         x = self.out_proj(x)
-
         return x
