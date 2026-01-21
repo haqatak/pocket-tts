@@ -396,19 +396,31 @@ class TTSModel(nn.Module):
 
         # This is a very simplistic way of handling long texts. We could do much better
         # by using teacher forcing, but it would be a bit slower.
-        # TODO: add the teacher forcing method for long texts where we use the audio of one chunk
-        # as conditioning for the next chunk.
         chunks = split_into_best_sentences(self.flow_lm.conditioner.tokenizer, text_to_generate)
 
-        for chunk in chunks:
-            text_to_generate, frames_after_eos_guess = prepare_text_prompt(chunk)
+        current_model_state = model_state
+        if copy_state:
+            current_model_state = copy.deepcopy(model_state)
+
+        for i, chunk in enumerate(chunks):
+            chunk_text, frames_after_eos_guess = prepare_text_prompt(chunk)
             frames_after_eos_guess += 2
-            yield from self._generate_audio_stream_short_text(
-                model_state=model_state,
-                text_to_generate=chunk,
+
+            # We capture the audio to use it as conditioning for the next chunk
+            generated_audio_parts = []
+            for audio_part in self._generate_audio_stream_short_text(
+                model_state=current_model_state,
+                text_to_generate=chunk_text,
                 frames_after_eos=frames_after_eos_guess,
-                copy_state=copy_state,
-            )
+                copy_state=False,
+            ):
+                generated_audio_parts.append(audio_part)
+                yield audio_part
+
+            # If there is a next chunk, we use the generated audio to condition the model
+            if i < len(chunks) - 1:
+                full_audio = torch.cat(generated_audio_parts, dim=0).unsqueeze(0)
+                current_model_state = self.get_state_for_audio_prompt(full_audio, truncate=True)
 
     @torch.no_grad
     def _generate_audio_stream_short_text(
